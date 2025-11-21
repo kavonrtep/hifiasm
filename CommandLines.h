@@ -170,6 +170,10 @@ typedef struct {
     int64_t rl_cut;
     int64_t sc_cut;
 
+    // NEW: Read-to-contig mapping export
+    uint8_t write_read_mapping;   // Enable export of read-to-contig mappings
+    void *read_mapping_ptr;       // Pointer to read mapping vector for internal use (void* to avoid circular dependency)
+
 } hifiasm_opt_t;
 
 extern hifiasm_opt_t asm_opt;

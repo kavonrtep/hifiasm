@@ -16952,7 +16952,7 @@ ma_ug_t* output_trio_unitig_graph_ul(ug_opt_t *uopt, ul_resolve_t *uidx, char* o
     // }
 
     fprintf(stderr, "Writing %s to disk... \n", gfa_name);
-    ma_ug_seq(ug, uidx->sg, uopt->coverage_cut, uopt->sources, &ne, uopt->max_hang, uopt->min_ovlp, 0, 1);
+    ma_ug_seq(ug, uidx->sg, uopt->coverage_cut, uopt->sources, &ne, uopt->max_hang, uopt->min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     
     ma_ug_print(ug, uidx->sg, uopt->coverage_cut, uopt->sources, uopt->ruIndex, (flag==FATHER?"h1tg":"h2tg"), output_file);
     fclose(output_file);

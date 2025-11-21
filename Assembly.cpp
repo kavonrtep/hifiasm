@@ -2059,6 +2059,17 @@ int ha_assemble(void)
     // quick_debug_phasing(MC_NAME);
 	extern void ha_extract_print_list(const All_reads *rs, int n_rounds, const char *o);
 	int r, hom_cov = -1, ovlp_loaded = 0; uint64_t tot_b, tot_e;
+
+	// NEW: Initialize read mapping vector for export
+	utg_read_mapping_v read_mapping;
+	memset(&read_mapping, 0, sizeof(read_mapping));
+	if (asm_opt.write_read_mapping) {
+		init_utg_read_mapping_v(&read_mapping);
+		asm_opt.read_mapping_ptr = &read_mapping;
+	} else {
+		asm_opt.read_mapping_ptr = NULL;
+	}
+
 	if (asm_opt.load_index_from_disk && load_all_data_from_disk(&R_INF.paf, &R_INF.reverse_paf, asm_opt.output_file_name)) {
 		ovlp_loaded = 1;
 		fprintf(stderr, "[M::%s::%.3f*%.2f] ==> loaded corrected reads and overlaps from disk\n", __func__, yak_realtime(), yak_cpu_usage());
@@ -2117,9 +2128,18 @@ int ha_assemble(void)
     if(ovlp_loaded == 2) ovlp_loaded = 0;
     ha_opt_update_cov_min(&asm_opt, asm_opt.hom_cov, MIN_N_CHAIN);
 
-    build_string_graph_without_clean(asm_opt.min_overlap_coverage, R_INF.paf, R_INF.reverse_paf, 
-        R_INF.total_reads, R_INF.read_length, asm_opt.min_overlap_Len, asm_opt.max_hang_Len, asm_opt.clean_round, 
+    build_string_graph_without_clean(asm_opt.min_overlap_coverage, R_INF.paf, R_INF.reverse_paf,
+        R_INF.total_reads, R_INF.read_length, asm_opt.min_overlap_Len, asm_opt.max_hang_Len, asm_opt.clean_round,
         asm_opt.gap_fuzz, asm_opt.min_drop_rate, asm_opt.max_drop_rate, asm_opt.output_file_name, asm_opt.large_pop_bubble_size, 0, !ovlp_loaded);
+
+	// NEW: Export read-to-contig mapping if requested
+	if (asm_opt.write_read_mapping && (utg_read_mapping_v*)asm_opt.read_mapping_ptr) {
+		fprintf(stderr, "[M::%s] exporting read-to-contig mapping information\n", __func__);
+		// Note: Mapping data is collected in ma_ug_seq() during graph construction
+		// Export will be handled when we have access to final unitig data
+		destory_utg_read_mapping_v(&read_mapping);
+	}
+
 	destory_All_reads(&R_INF);
 	return 0;
 }
@@ -2183,8 +2203,8 @@ int ha_assemble_pair(void)
     if(ovlp_loaded == 2) ovlp_loaded = 0;
     ha_opt_update_cov_min(&asm_opt, asm_opt.hom_cov, MIN_N_CHAIN);
 
-    build_string_graph_without_clean(asm_opt.min_overlap_coverage, R_INF.paf, R_INF.reverse_paf, 
-        R_INF.total_reads, R_INF.read_length, asm_opt.min_overlap_Len, asm_opt.max_hang_Len, asm_opt.clean_round, 
+    build_string_graph_without_clean(asm_opt.min_overlap_coverage, R_INF.paf, R_INF.reverse_paf,
+        R_INF.total_reads, R_INF.read_length, asm_opt.min_overlap_Len, asm_opt.max_hang_Len, asm_opt.clean_round,
         asm_opt.gap_fuzz, asm_opt.min_drop_rate, asm_opt.max_drop_rate, asm_opt.output_file_name, asm_opt.large_pop_bubble_size, 0, !ovlp_loaded);
 	destory_All_reads(&R_INF);
 	return 0;

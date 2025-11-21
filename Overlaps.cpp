@@ -10473,8 +10473,9 @@ ma_ug_t *gen_polished_ug(const ug_opt_t *uopt, asg_t *sg)
 
 
 // generate unitig sequences
-int ma_ug_seq(ma_ug_t *g, asg_t *read_g, ma_sub_t *coverage_cut, ma_hit_t_alloc* sources, 
-kvec_asg_arc_t_warp* edge, int max_hang, int min_ovlp, kvec_asg_arc_t_warp *E, uint32_t is_polish)
+int ma_ug_seq(ma_ug_t *g, asg_t *read_g, ma_sub_t *coverage_cut, ma_hit_t_alloc* sources,
+kvec_asg_arc_t_warp* edge, int max_hang, int min_ovlp, kvec_asg_arc_t_warp *E, uint32_t is_polish,
+utg_read_mapping_v *read_mapping)
 {
     UC_Read g_read;
     init_UC_Read(&g_read);
@@ -10508,6 +10509,21 @@ kvec_asg_arc_t_warp* edge, int max_hang, int min_ovlp, kvec_asg_arc_t_warp *E, u
             ori = u->a[j]>>32&1;
             start = l;
             eLen = (uint32_t)u->a[j];
+
+            // ========================================================================
+            // NEW: Track read position for export
+            // ========================================================================
+            if (read_mapping != NULL && rId < R_INF.total_reads) {
+                utg_read_mapping_t entry;
+                entry.read_id = rId;
+                entry.contig_id = i;
+                entry.start_pos = start;
+                entry.end_pos = start + eLen;
+                entry.ori = ori;
+                entry.coverage_class = 0;  // Primary by default
+                add_utg_read_mapping(read_mapping, &entry);
+            }
+
 			l += eLen;
 
             if(eLen == 0) continue;
@@ -10999,10 +11015,70 @@ ma_hit_t_alloc* sources, R_to_U* ruIndex, int print_seq, const char* prefix, FIL
     free(primary_flag);    
 }
 
-void ma_ug_print(const ma_ug_t *ug, asg_t* read_g, const ma_sub_t *coverage_cut, 
+void ma_ug_print(const ma_ug_t *ug, asg_t* read_g, const ma_sub_t *coverage_cut,
 ma_hit_t_alloc* sources, R_to_U* ruIndex, const char* prefix, FILE *fp)
 {
 	ma_ug_print2(ug, &R_INF, read_g, coverage_cut, sources, ruIndex, 1, prefix, fp);
+}
+
+// ============================================================================
+// NEW: Read-to-Contig Mapping Export Function
+// ============================================================================
+
+void write_utg_read_mapping(const char *output_prefix, const ma_ug_t *ug,
+                           const void *RNF, const char *prefix,
+                           utg_read_mapping_v *read_mapping)
+{
+	if (!read_mapping || read_mapping->n == 0) return;
+
+	char *filename = (char*)malloc(strlen(output_prefix) + 30);
+	sprintf(filename, "%s.%s.reads.tsv", output_prefix, prefix);
+
+	FILE *fp = fopen(filename, "w");
+	if (!fp) {
+		fprintf(stderr, "[ERROR] Cannot open %s for writing\n", filename);
+		free(filename);
+		return;
+	}
+
+	// Write header
+	fprintf(fp, "contig_id\tread_id\tstrand\tstart\tend\tread_len\tcov_class\n");
+
+	// Coverage class names
+	const char *cov_classes[] = {"primary", "alternate", "hap1", "hap2", "fake"};
+
+	// Write mappings
+	for (size_t i = 0; i < read_mapping->n; i++) {
+		utg_read_mapping_t *entry = &read_mapping->a[i];
+		uint32_t rId = entry->read_id;
+
+		// Note: RNF parameter would be used for validation if available
+		// For now, skip validation
+
+		// Build contig name
+		char contig_name[32];
+		sprintf(contig_name, "%s%.6d%c", prefix, entry->contig_id + 1,
+				ug->u.a[entry->contig_id].circ ? 'c' : 'l');
+
+		// Get coverage class name
+		const char *cov_class = (entry->coverage_class < 5) ?
+								cov_classes[entry->coverage_class] : "unknown";
+
+		// Write entry
+		fprintf(fp, "%s\t%u\t%c\t%u\t%u\t%u\t%s\n",
+				contig_name,
+				rId,
+				entry->ori ? '-' : '+',
+				entry->start_pos,
+				entry->end_pos,
+				entry->end_pos - entry->start_pos,
+				cov_class);
+	}
+
+	fclose(fp);
+	fprintf(stderr, "[M::%s] Written %zu read-to-contig mappings to %s\n",
+			__func__, read_mapping->n, filename);
+	free(filename);
 }
 
 void prt_scaf_stats(sec_t *scp, ma_ug_t *ctg, const char* prefix, uint64_t id)
@@ -13858,7 +13934,7 @@ ma_hit_t_alloc* sources, R_to_U* ruIndex, int max_hang, int min_ovlp)
 
     ma_ug_t *ug = NULL;
     ug = ma_ug_gen(sg);
-    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 1);
+    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
 
     fprintf(stderr, "Writing raw unitig GFA to disk... \n");
     char* gfa_name = (char*)malloc(strlen(output_file_name)+25);
@@ -14197,7 +14273,7 @@ ma_hit_t_alloc* sources, R_to_U* ruIndex, int max_hang, int min_ovlp, kvec_asg_a
         NULL, &asm_opt.b_high_cov, asm_opt.m_rate);
     }
 
-    ma_ug_seq(*ug, sg, coverage_cut, sources, new_rtg_edges, max_hang, min_ovlp, 0, 1);
+    ma_ug_seq(*ug, sg, coverage_cut, sources, new_rtg_edges, max_hang, min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
 
     
     char* gfa_name = (char*)malloc(strlen(output_file_name)+35);
@@ -16257,7 +16333,7 @@ long long gap_fuzz, bub_label_t* b_mask_t, ug_opt_t *opt)
     ug = ma_ug_gen_primary(sg, PRIMARY_LABLE);
 
     new_rtg_edges.a.n = 0;
-    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, &d_edges, 1);///polish
+    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, &d_edges, 1, NULL);///polish
     
     hap_cov_t *cov = NULL;
     trans_chain* t_ch = NULL;
@@ -16513,7 +16589,7 @@ float chimeric_rate, float drop_ratio, int max_hang, int min_ovlp, long long gap
     ma_ug_t *ug = ma_ug_gen_primary(sg, PRIMARY_LABLE);
 
     new_rtg_edges.a.n = 0;
-    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, &d_edges, 1);///polish
+    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, &d_edges, 1, NULL);///polish
     
     hap_cov_t *cov = NULL;
     trans_chain* t_ch = NULL;
@@ -16701,7 +16777,7 @@ int max_hang, int min_ovlp, R_to_U* ruIndex, bub_label_t* b_mask_t)
     delete_useless_nodes(&ug);
     renew_utg(&ug, sg, NULL); 
 
-    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, &d_edges, 1);
+    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, &d_edges, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
 
     kv_destroy(new_rtg_edges.a);  kv_destroy(d_edges.a);
     horder_clean_sg_by_utg(sg, ug);
@@ -17549,7 +17625,7 @@ int gap_fuzz, bub_label_t* b_mask_t, ug_opt_t *opt)
     ug = ma_ug_gen_primary(sg, PRIMARY_LABLE);
 
     new_rtg_edges.a.n = 0;
-    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, &d_edges, 1);///polish
+    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, &d_edges, 1, NULL);///polish
 
     new_rtg_edges.a.n = 0;
     hap_cov_t *cov = NULL;
@@ -17986,9 +18062,9 @@ ma_hit_t_alloc* sources, R_to_U* ruIndex, int max_hang, int min_ovlp, int is_upd
 
     if(is_update_ou) update_ug_ou(ug, read_g);
     if(is_seq) {
-        ma_ug_seq(ug, read_g, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 0);
+        ma_ug_seq(ug, read_g, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 0, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     }
-    // if(is_polish) ma_ug_seq(ug, read_g, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 0);
+    // if(is_polish) ma_ug_seq(ug, read_g, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 0, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
 
     fprintf(stderr, "Writing raw unitig GFA to disk... \n");
     char* gfa_name = (char*)malloc(strlen(output_file_name)+50);
@@ -21210,7 +21286,7 @@ int is_bench, bub_label_t* b_mask_t, char *f_prefix, uint8_t *kpt_buf, kvec_asg_
     ///debug_utg_graph(ug, sg, 0, 0);
     ///debug_untig_length(ug, tipsLen, gfa_name);
     ///print_untig_by_read(ug, "m64011_190901_095311/125831121/ccs", 2310925, "end");
-    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 1);
+    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     ma_ug_print(ug, sg, coverage_cut, sources, ruIndex, (flag==FATHER?"h1tg":"h2tg"), output_file);
     fclose(output_file);
 
@@ -21246,7 +21322,7 @@ R_to_U* ruIndex, int max_hang, int min_ovlp, char *f_prefix)
     ///debug_utg_graph(ug, sg, 0, 0);
     ///debug_untig_length(ug, tipsLen, gfa_name);
     ///print_untig_by_read(ug, "m64011_190901_095311/125831121/ccs", 2310925, "end");
-    ma_ug_seq(ug, sg, coverage_cut, sources, arcs, max_hang, min_ovlp, 0, 1);
+    ma_ug_seq(ug, sg, coverage_cut, sources, arcs, max_hang, min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     ma_ug_print(ug, sg, coverage_cut, sources, ruIndex, (flag==FATHER?"h1tg":"h2tg"), output_file);
     fclose(output_file);
 
@@ -21274,7 +21350,7 @@ void output_hap_sc_graph(kvect_sec_t *ug, asg_t *sg, /**kvec_asg_arc_t_warp *arc
 
     fprintf(stderr, "Writing %s to disk... \n", gfa_name);
 
-    // ma_ug_seq(ug->ctg, sg, coverage_cut, sources, arcs, max_hang, min_ovlp, 0, 1);
+    // ma_ug_seq(ug->ctg, sg, coverage_cut, sources, arcs, max_hang, min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     // ma_ug_print(ug, sg, coverage_cut, sources, ruIndex, (flag==FATHER?"h1tg":"h2tg"), output_file);
     ma_scg_print(ug, &R_INF, sg, coverage_cut, sources, ruIndex, 1, (flag==FATHER?"h1tg":"h2tg"), output_file);
     fclose(output_file);
@@ -22885,7 +22961,7 @@ long long tipsLen, float tip_drop_ratio, long long stops_threshold, R_to_U* ruIn
 
     filter_u_trans(&(cov->t_ch->k_trans), asm_opt.is_bub_trans, asm_opt.is_topo_trans, asm_opt.is_read_trans, asm_opt.is_base_trans);
     if(asm_opt.is_base_trans) {
-        ma_ug_seq(ccref, sg, cover, src, NULL, max_hang, min_ovlp, NULL, 0);///polish
+        ma_ug_seq(ccref, sg, cover, src, NULL, max_hang, min_ovlp, NULL, 0, NULL);///polish
         trans_base_infer(ccref, sg, opt, &(cov->t_ch->k_trans), NULL);
         ma_ug_destroy(ccref);
     } 
@@ -23144,13 +23220,13 @@ inline uint64_t cal_offset_len(double off, double len0, double len1)
 void gen_scaffold_bases(kvect_sec_t *sc0, kvect_sec_t *sc1, ma_ug_t *mg, asg_t *sg, ma_sub_t* cover, ma_hit_t_alloc* src, kvec_asg_arc_t_warp *arcs, int max_hang, int min_ovlp, kv_u_trans_t *p)
 {
     if(!p) {
-        ma_ug_seq(mg, sg, cover, src, arcs, max_hang, min_ovlp, 0, 1);
+        ma_ug_seq(mg, sg, cover, src, arcs, max_hang, min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     } else {
         uint64_t k, kn, *l0 = NULL, *l1 = NULL, s, e; 
         kn = sc0->n + sc1->n; 
         CALLOC(l0, kn); CALLOC(l1, kn);
         for (k = 0; k < kn; k++) l0[k] = get_scp_len(((k<sc0->n)?&(sc0->a[k]):&(sc1->a[k-sc0->n])), mg);
-        ma_ug_seq(mg, sg, cover, src, arcs, max_hang, min_ovlp, 0, 1);
+        ma_ug_seq(mg, sg, cover, src, arcs, max_hang, min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
         for (k = 0; k < kn; k++) l1[k] = get_scp_len(((k<sc0->n)?&(sc0->a[k]):&(sc1->a[k-sc0->n])), mg);
 
         for (k = 0; k < p->n; k++) {
@@ -23199,7 +23275,7 @@ long long tipsLen, float tip_drop_ratio, long long stops_threshold, R_to_U* ruIn
 
     gen_scaffold_bases(*sc0, *sc1, *rmg, sg, cover, src, arcs, max_hang, min_ovlp, ((rs_trans)?(*rs_trans):(NULL)));
 
-    // ma_ug_seq(*rmg, sg, cover, src, arcs, max_hang, min_ovlp, 0, 1);
+    // ma_ug_seq(*rmg, sg, cover, src, arcs, max_hang, min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
 
     // if(rs_trans) adjust_scaffold_ovlp(sc0, sc1, rmg, (*rs_trans));
     
@@ -32571,7 +32647,7 @@ R_to_U* ruIndex, int max_hang, int min_ovlp, kvec_asg_arc_t_warp* new_rtg_edges,
     if(r_het) set_r_het_status(r_het, sa, *ug, asm_opt.polyploidy);
     free(sa->a); free(sa);
     return ta;
-    // ma_ug_seq(*ug, read_g, coverage_cut, sources, new_rtg_edges, max_hang, min_ovlp, 0, 0);
+    // ma_ug_seq(*ug, read_g, coverage_cut, sources, new_rtg_edges, max_hang, min_ovlp, 0, 0, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     // ug_idx_build(*ug, asm_opt.polyploidy);
     // topo_ovlp_collect(*ug, read_g, sources, reverse_sources, coverage_cut, tipsLen, tip_drop_ratio, 
     // stops_threshold, ruIndex, chimeric_rate, drop_ratio, max_hang, min_ovlp, cov);
@@ -32610,7 +32686,7 @@ R_to_U* ruIndex, int max_hang, int min_ovlp, const ug_opt_t *uopt)
     // reset_untig_hap_label(ug, 273, FATHER, R_INF.trio_flag);
     // reset_untig_hap_label(ug, 822, FATHER, R_INF.trio_flag);
 
-    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 1);
+    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
 
     fprintf(stderr, "Writing processed unitig GFA to disk... \n");
     char* gfa_name = (char*)malloc(strlen(output_file_name)+35);
@@ -32618,7 +32694,7 @@ R_to_U* ruIndex, int max_hang, int min_ovlp, const ug_opt_t *uopt)
     FILE* output_file = fopen(gfa_name, "w");
     ma_ug_print(ug, sg, coverage_cut, sources, ruIndex, "utg", output_file);
     fclose(output_file);
-    
+
     sprintf(gfa_name, "%s.p_utg.noseq.gfa", output_file_name);
     output_file = fopen(gfa_name, "w");
     ma_ug_print_simple(ug, sg, coverage_cut, sources, ruIndex, "utg", output_file);
@@ -32627,9 +32703,14 @@ R_to_U* ruIndex, int max_hang, int min_ovlp, const ug_opt_t *uopt)
     {
         sprintf(gfa_name, "%s.p_utg.lowQ.bed", output_file_name);
         output_file = fopen(gfa_name, "w");
-        ma_ug_print_bed(ug, sg, &R_INF, coverage_cut, sources, &new_rtg_edges, 
+        ma_ug_print_bed(ug, sg, &R_INF, coverage_cut, sources, &new_rtg_edges,
         max_hang, min_ovlp, asm_opt.bed_inconsist_rate, "utg", output_file, NULL);
         fclose(output_file);
+    }
+
+    // NEW: Export read-to-contig mapping if requested
+    if (asm_opt.write_read_mapping && asm_opt.read_mapping_ptr) {
+        write_utg_read_mapping(output_file_name, ug, NULL, "utg", (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     }
 
     ///for debug
@@ -32665,9 +32746,9 @@ R_to_U* ruIndex, float chimeric_rate, float drop_ratio, int max_hang, int min_ov
         break_ug_contig(&ug, sg, &R_INF, coverage_cut, sources, ruIndex, &new_rtg_edges, max_hang, min_ovlp, 
         NULL, &asm_opt.b_high_cov, asm_opt.m_rate);
     }
-    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 1);
-    
-    
+    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
+
+
     fprintf(stderr, "Writing primary contig GFA to disk... \n");
     char* gfa_name = (char*)malloc(strlen(output_file_name)+35);
     sprintf(gfa_name, "%s.p_ctg.gfa", output_file_name);
@@ -32683,9 +32764,14 @@ R_to_U* ruIndex, float chimeric_rate, float drop_ratio, int max_hang, int min_ov
     {
         sprintf(gfa_name, "%s.p_ctg.lowQ.bed", output_file_name);
         output_file = fopen(gfa_name, "w");
-        ma_ug_print_bed(ug, sg, &R_INF, coverage_cut, sources, &new_rtg_edges, 
+        ma_ug_print_bed(ug, sg, &R_INF, coverage_cut, sources, &new_rtg_edges,
         max_hang, min_ovlp, asm_opt.bed_inconsist_rate, "ptg", output_file, NULL);
         fclose(output_file);
+    }
+
+    // NEW: Export read-to-contig mapping if requested
+    if (asm_opt.write_read_mapping && asm_opt.read_mapping_ptr) {
+        write_utg_read_mapping(output_file_name, ug, NULL, "ptg", (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     }
 
     free(gfa_name);
@@ -32709,7 +32795,7 @@ ma_hit_t_alloc* sources, R_to_U* ruIndex, int max_hang, int min_ovlp)
     //     break_ug_contig(&ug, sg, &R_INF, coverage_cut, sources, ruIndex, &new_rtg_edges, max_hang, min_ovlp, asm_opt.b_low_cov);
     // }
 
-    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 1);
+    ma_ug_seq(ug, sg, coverage_cut, sources, &new_rtg_edges, max_hang, min_ovlp, 0, 1, (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
 
     fprintf(stderr, "Writing alternate contig GFA to disk... \n");
     char* gfa_name = (char*)malloc(strlen(output_file_name)+35);
@@ -33045,6 +33131,33 @@ void init_R_to_U(R_to_U* x, uint64_t len)
 void destory_R_to_U(R_to_U* x)
 {
 	free(x->index);
+}
+
+// ============================================================================
+// NEW: Read-to-Contig Mapping Vector Operations
+// ============================================================================
+
+void init_utg_read_mapping_v(utg_read_mapping_v *x)
+{
+	x->n = 0;
+	x->m = 1024;  // Pre-allocate for typical assembly
+	MALLOC(x->a, x->m);
+}
+
+void destory_utg_read_mapping_v(utg_read_mapping_v *x)
+{
+	free(x->a);
+	x->a = NULL;
+	x->n = x->m = 0;
+}
+
+void add_utg_read_mapping(utg_read_mapping_v *x, utg_read_mapping_t *e)
+{
+	if (x->n >= x->m) {
+		x->m = x->m * 2;
+		REALLOC(x->a, x->m);
+	}
+	x->a[x->n++] = *e;
 }
 
 void set_R_to_U(R_to_U* x, uint32_t rID, uint32_t uID, uint32_t is_Unitig, uint8_t* flag)
@@ -39676,10 +39789,10 @@ ma_sub_t **coverage_cut_ptr, uint8_t *cmk, int debug_g)
 }
 
 void build_string_graph_without_clean(
-int min_dp, ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources, 
-uint64_t n_read, uint64_t* readLen, long long mini_overlap_length, 
+int min_dp, ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources,
+uint64_t n_read, uint64_t* readLen, long long mini_overlap_length,
 long long max_hang_length, long long clean_round, long long gap_fuzz,
-float min_ovlp_drop_ratio, float max_ovlp_drop_ratio, char* output_file_name, 
+float min_ovlp_drop_ratio, float max_ovlp_drop_ratio, char* output_file_name,
 long long bubble_dist, int read_graph, int write)
 {
     R_to_U ruIndex;

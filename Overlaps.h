@@ -631,10 +631,10 @@ static inline int count_out_without_del(const asg_t *g, uint32_t v)
 
 
 void build_string_graph_without_clean(
-int min_dp, ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources, 
-uint64_t n_read, uint64_t* readLen, long long mini_overlap_length, 
+int min_dp, ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources,
+uint64_t n_read, uint64_t* readLen, long long mini_overlap_length,
 long long max_hang_length, long long clean_round, long long gap_fuzz,
-float min_ovlp_drop_ratio, float max_ovlp_drop_ratio, char* output_file_name, 
+float min_ovlp_drop_ratio, float max_ovlp_drop_ratio, char* output_file_name,
 long long bubble_dist, int read_graph, int write);
 
 void debug_info_of_specfic_read(const char* name, ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources, int id, const char* command);
@@ -1101,9 +1101,33 @@ int asg_arc_del_trans(asg_t *g, int fuzz);
 void kt_u_trans_t_idx(kv_u_trans_t *ta, uint32_t n);
 void kt_u_trans_t_simple_symm(kv_u_trans_t *ta, uint32_t un, uint32_t symm_add);
 uint32_t get_u_trans_spec(kv_u_trans_t *ta, uint32_t qn, uint32_t tn, u_trans_t **r_a, uint32_t *occ);
-int ma_ug_seq(ma_ug_t *g, asg_t *read_g, ma_sub_t *coverage_cut, ma_hit_t_alloc* sources, 
-kvec_asg_arc_t_warp* edge, int max_hang, int min_ovlp, kvec_asg_arc_t_warp *E, uint32_t is_polish);
 
+// NEW: Read-to-Contig Mapping Export Structures
+typedef struct {
+	uint32_t read_id;              // Which read
+	uint32_t contig_id;            // Which contig (index)
+	uint32_t start_pos;            // Position in contig
+	uint32_t end_pos;              // Position in contig
+	uint8_t ori;                   // Strand: 0=forward, 1=reverse complement
+	uint16_t coverage_class;       // Classification (primary, alternate, hap1, hap2, fake)
+} utg_read_mapping_t;              // Total: 20 bytes
+
+typedef struct {
+	utg_read_mapping_t *a;
+	size_t n, m;                   // Current count and allocated size
+} utg_read_mapping_v;
+
+int ma_ug_seq(ma_ug_t *g, asg_t *read_g, ma_sub_t *coverage_cut, ma_hit_t_alloc* sources,
+kvec_asg_arc_t_warp* edge, int max_hang, int min_ovlp, kvec_asg_arc_t_warp *E, uint32_t is_polish,
+utg_read_mapping_v *read_mapping);
+
+// NEW: Function declarations for read-to-contig mapping
+void init_utg_read_mapping_v(utg_read_mapping_v *x);
+void destory_utg_read_mapping_v(utg_read_mapping_v *x);
+void add_utg_read_mapping(utg_read_mapping_v *x, utg_read_mapping_t *e);
+void write_utg_read_mapping(const char *output_prefix, const ma_ug_t *ug,
+                           const void *RNF, const char *prefix,
+                           utg_read_mapping_v *read_mapping);
 
 typedef struct{
     ma_sub_t* coverage_cut;

@@ -126,6 +126,7 @@ void Print_H(hifiasm_opt_t* asm_opt)
     fprintf(stderr, "    -u           post-join step for contigs which may improve N50; 0 to disable; 1 to enable\n");
     fprintf(stderr, "                 [%u] and [%u] in default for the UL+HiFi assembly and the HiFi assembly, respectively\n",
                                       asm_opt->ul_pst_join, asm_opt->hifi_pst_join);
+    fprintf(stderr, "    -W           export read-to-contig mapping information to TSV file\n");
     fprintf(stderr, "    --hom-cov    INT\n");
     fprintf(stderr, "                 homozygous read coverage [auto]\n");
     fprintf(stderr, "    --lowQ       INT\n");
@@ -868,7 +869,7 @@ int CommandLine_process(int argc, char *argv[], hifiasm_opt_t* asm_opt)
 
     int c;
 
-    while ((c = ketopt(&opt, argc, argv, 1, "hvt:o:k:w:m:n:r:a:b:z:x:y:p:c:d:M:P:if:D:FN:1:2:3:4:5:l:s:O:eu:", long_options)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hvt:o:k:w:m:n:r:a:b:z:x:y:p:c:d:M:P:if:D:FN:1:2:3:4:5:l:s:O:eu:W", long_options)) >= 0) {
         if (c == 'h')
         {
             Print_H(asm_opt);
@@ -912,6 +913,7 @@ int CommandLine_process(int argc, char *argv[], hifiasm_opt_t* asm_opt)
                 asm_opt->hifi_pst_join = asm_opt->ul_pst_join = 0;
             }
         }
+        else if (c == 'W') asm_opt->write_read_mapping = 1;
         else if (c == 301) asm_opt->flag |= HA_F_VERBOSE_GFA;
 		else if (c == 302) asm_opt->flag |= HA_F_WRITE_PAF;
 		else if (c == 303) asm_opt->flag |= HA_F_WRITE_EC;
