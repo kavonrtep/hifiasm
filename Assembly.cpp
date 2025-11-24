@@ -2140,6 +2140,11 @@ int ha_assemble(void)
 		destory_utg_read_mapping_v(&read_mapping);
 	}
 
+	// NEW: Export read ID to read name mapping
+	if (asm_opt.write_read_mapping) {
+		write_read_id_mapping(asm_opt.output_file_name, &R_INF);
+	}
+
 	destory_All_reads(&R_INF);
 	return 0;
 }

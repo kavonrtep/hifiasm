@@ -11081,6 +11081,58 @@ void write_utg_read_mapping(const char *output_prefix, const ma_ug_t *ug,
 	free(filename);
 }
 
+void write_read_id_mapping(const char *output_prefix, const void *RNF_void)
+{
+	const All_reads *RNF = (const All_reads *)RNF_void;
+	if (!RNF || RNF->total_reads == 0) return;
+
+	char *filename = (char*)malloc(strlen(output_prefix) + 30);
+	sprintf(filename, "%s.read_id_mapping.tsv", output_prefix);
+
+	FILE *fp = fopen(filename, "w");
+	if (!fp) {
+		fprintf(stderr, "[ERROR] Cannot open %s for writing\n", filename);
+		free(filename);
+		return;
+	}
+
+	// Write header
+	fprintf(fp, "read_index\tread_name\tread_length\n");
+
+	// Write each read's mapping
+	for (uint64_t i = 0; i < RNF->total_reads; i++) {
+		// Extract read name from the name buffer using name_index
+		uint64_t name_start = RNF->name_index[i];
+		uint64_t name_end = (i + 1 < RNF->total_reads) ? RNF->name_index[i + 1] : RNF->total_name_length;
+
+		// Find the actual name (it's null-terminated or space-separated)
+		char *name_start_ptr = RNF->name + name_start;
+		char name_buffer[512];
+		uint64_t name_len = 0;
+
+		// Extract name up to space or null terminator
+		while (name_len < sizeof(name_buffer) - 1 &&
+		       name_start + name_len < name_end &&
+		       RNF->name[name_start + name_len] != ' ' &&
+		       RNF->name[name_start + name_len] != '\0') {
+			name_buffer[name_len] = RNF->name[name_start + name_len];
+			name_len++;
+		}
+		name_buffer[name_len] = '\0';
+
+		// Write mapping: read_index \t read_name \t read_length
+		fprintf(fp, "%lu\t%s\t%lu\n",
+				i,
+				name_buffer,
+				RNF->read_length[i]);
+	}
+
+	fclose(fp);
+	fprintf(stderr, "[M::%s] Written read ID mapping for %lu reads to %s\n",
+			__func__, RNF->total_reads, filename);
+	free(filename);
+}
+
 void prt_scaf_stats(sec_t *scp, ma_ug_t *ctg, const char* prefix, uint64_t id)
 {
     uint64_t k, tl0, tl1; ma_utg_t *z = NULL; char name[32];
@@ -14291,10 +14343,16 @@ ma_hit_t_alloc* sources, R_to_U* ruIndex, int max_hang, int min_ovlp, kvec_asg_a
     {
         sprintf(gfa_name, "%s.p_ctg.lowQ.bed", output_file_name);
         output_file = fopen(gfa_name, "w");
-        ma_ug_print_bed(*ug, sg, &R_INF, coverage_cut, sources, new_rtg_edges, 
+        ma_ug_print_bed(*ug, sg, &R_INF, coverage_cut, sources, new_rtg_edges,
         max_hang, min_ovlp, asm_opt.bed_inconsist_rate, "ptg", output_file, NULL);
         fclose(output_file);
     }
+
+    // NEW: Export read-to-contig mapping if requested
+    if (asm_opt.write_read_mapping && asm_opt.read_mapping_ptr) {
+        write_utg_read_mapping(output_file_name, *ug, NULL, "ptg", (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
+    }
+
     free(gfa_name);
 
     /*******************************for debug************************************/
@@ -21310,8 +21368,8 @@ int is_bench, bub_label_t* b_mask_t, char *f_prefix, uint8_t *kpt_buf, kvec_asg_
 }
 
 
-void output_hap_graph(ma_ug_t *ug, asg_t *sg, kvec_asg_arc_t_warp *arcs, 
-ma_sub_t* coverage_cut, char* output_file_name, uint8_t flag, ma_hit_t_alloc* sources, 
+void output_hap_graph(ma_ug_t *ug, asg_t *sg, kvec_asg_arc_t_warp *arcs,
+ma_sub_t* coverage_cut, char* output_file_name, uint8_t flag, ma_hit_t_alloc* sources,
 R_to_U* ruIndex, int max_hang, int min_ovlp, char *f_prefix)
 {
     char* gfa_name = (char*)malloc(strlen(output_file_name)+100);
@@ -21334,9 +21392,16 @@ R_to_U* ruIndex, int max_hang, int min_ovlp, char *f_prefix)
     {
         sprintf(gfa_name, "%s.%s.p_ctg.lowQ.bed", output_file_name, f_prefix?f_prefix:(flag==FATHER?"hap1":"hap2"));
         output_file = fopen(gfa_name, "w");
-        ma_ug_print_bed(ug, sg, &R_INF, coverage_cut, sources, arcs, 
+        ma_ug_print_bed(ug, sg, &R_INF, coverage_cut, sources, arcs,
         max_hang, min_ovlp, asm_opt.bed_inconsist_rate, (flag==FATHER?"h1tg":"h2tg"), output_file, NULL);
         fclose(output_file);
+    }
+
+    // NEW: Export read-to-contig mapping for haplotype if requested
+    if (asm_opt.write_read_mapping && asm_opt.read_mapping_ptr) {
+        write_utg_read_mapping(output_file_name, ug, NULL, (flag==FATHER?"h1tg":"h2tg"), (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
+        // Clear the vector for next haplotype export
+        clear_utg_read_mapping_v((utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     }
 
     free(gfa_name);
@@ -32711,6 +32776,8 @@ R_to_U* ruIndex, int max_hang, int min_ovlp, const ug_opt_t *uopt)
     // NEW: Export read-to-contig mapping if requested
     if (asm_opt.write_read_mapping && asm_opt.read_mapping_ptr) {
         write_utg_read_mapping(output_file_name, ug, NULL, "utg", (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
+        // Clear the vector for ptg export (will be refilled in output_contig_graph_primary)
+        clear_utg_read_mapping_v((utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     }
 
     ///for debug
@@ -33158,6 +33225,11 @@ void add_utg_read_mapping(utg_read_mapping_v *x, utg_read_mapping_t *e)
 		REALLOC(x->a, x->m);
 	}
 	x->a[x->n++] = *e;
+}
+
+void clear_utg_read_mapping_v(utg_read_mapping_v *x)
+{
+	x->n = 0;  // Reset count while keeping allocated memory
 }
 
 void set_R_to_U(R_to_U* x, uint32_t rID, uint32_t uID, uint32_t is_Unitig, uint8_t* flag)

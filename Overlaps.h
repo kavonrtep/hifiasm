@@ -1124,10 +1124,12 @@ utg_read_mapping_v *read_mapping);
 // NEW: Function declarations for read-to-contig mapping
 void init_utg_read_mapping_v(utg_read_mapping_v *x);
 void destory_utg_read_mapping_v(utg_read_mapping_v *x);
+void clear_utg_read_mapping_v(utg_read_mapping_v *x);
 void add_utg_read_mapping(utg_read_mapping_v *x, utg_read_mapping_t *e);
 void write_utg_read_mapping(const char *output_prefix, const ma_ug_t *ug,
                            const void *RNF, const char *prefix,
                            utg_read_mapping_v *read_mapping);
+void write_read_id_mapping(const char *output_prefix, const void *RNF);
 
 typedef struct{
     ma_sub_t* coverage_cut;
