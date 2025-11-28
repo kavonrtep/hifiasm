@@ -1130,6 +1130,34 @@ void write_utg_read_mapping(const char *output_prefix, const ma_ug_t *ug,
                            const void *RNF, const char *prefix,
                            utg_read_mapping_v *read_mapping);
 void write_read_id_mapping(const char *output_prefix, const void *RNF);
+void augment_read_mapping_with_complete_reads(utg_read_mapping_v *read_mapping, const ma_ug_t *ug,
+                                               const void *RNF_void, const void *sources_void,
+                                               const void *coverage_cut_void, const void *ruIndex_void);
+void write_read_coverage_and_overlaps(const char *output_prefix, const void *RNF_void,
+                                       const void *sources_void, const void *coverage_cut_void,
+                                       utg_read_mapping_v *assembled_reads);
+
+// NEW: Read Lineage Tracking Structure
+// Tracks the ancestry of each backbone read through the assembly pipeline
+typedef struct {
+	uint32_t backbone_read_id;      // ID of backbone read in final assembly
+	uint32_t num_contributors;      // Number of original reads that contributed
+	uint32_t *contributor_ids;      // Array of original read IDs that contributed
+	uint8_t  lineage_type;          // 0=direct, 1=contained_in, 2=merged_via_bubble, 3=rescue_path
+} read_lineage_t;
+
+typedef struct {
+	read_lineage_t *a;
+	size_t n, m;                    // Current count and allocated size
+} read_lineage_v;
+
+// NEW: Function declarations for read lineage tracking
+void init_read_lineage_v(read_lineage_v *x);
+void destory_read_lineage_v(read_lineage_v *x);
+void add_read_lineage(read_lineage_v *x, read_lineage_t *entry);
+void write_read_lineage(const char *output_prefix, read_lineage_v *lineage);
+void build_read_lineage_from_overlaps(read_lineage_v *lineage, const utg_read_mapping_v *backbone_reads,
+                                       const void *sources_void, const void *RNF_void);
 
 typedef struct{
     ma_sub_t* coverage_cut;

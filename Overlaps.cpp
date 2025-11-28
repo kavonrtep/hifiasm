@@ -11133,6 +11133,385 @@ void write_read_id_mapping(const char *output_prefix, const void *RNF_void)
 	free(filename);
 }
 
+// ============================================================================
+// NEW: Augment read mappings with all assigned reads (not just backbone)
+// ============================================================================
+void augment_read_mapping_with_complete_reads(utg_read_mapping_v *read_mapping, const ma_ug_t *ug,
+                                               const void *RNF_void, const void *sources_void,
+                                               const void *coverage_cut_void, const void *ruIndex_void)
+{
+	const All_reads *RNF = (const All_reads *)RNF_void;
+	const ma_hit_t_alloc *sources = (const ma_hit_t_alloc *)sources_void;
+	const R_to_U *ruIndex = (const R_to_U *)ruIndex_void;
+
+	if (!read_mapping || !RNF || !ug || RNF->total_reads == 0) return;
+
+	// Build a set of already-written reads to avoid duplicates
+	uint8_t *already_written = (uint8_t *)calloc(RNF->total_reads, sizeof(uint8_t));
+	for (size_t i = 0; i < read_mapping->n; i++) {
+		already_written[read_mapping->a[i].read_id] = 1;
+	}
+
+	uint64_t new_mappings = 0;
+
+	// Iterate through all reads and add those not in backbone
+	for (uint64_t rId = 0; rId < RNF->total_reads; rId++) {
+		if (already_written[rId]) {
+			continue;  // Already in backbone
+		}
+
+		if (!ruIndex || rId >= ruIndex->len) {
+			continue;  // Read not assigned to any contig
+		}
+
+		uint32_t uId_packed = ruIndex->index[rId];
+		uint32_t uId = uId_packed & 0x7fffffff;  // Lower 31 bits = unitig/contig ID
+
+		if (uId >= ug->u.n) {
+			continue;  // Invalid contig ID
+		}
+
+		ma_utg_t *u = &ug->u.a[uId];
+		if (u->m == 0 || u->len == 0) {
+			continue;  // Empty contig
+		}
+
+		// Get approximate position - default to full contig span
+		uint32_t estimated_start = 0;
+		uint32_t estimated_end = u->len;
+
+		// Try to find a more precise position by checking overlaps to backbone reads in contig
+		if (sources && rId < RNF->total_reads) {
+			ma_hit_t_alloc *src = (ma_hit_t_alloc *)&sources[rId];
+			if (src->buffer && src->length > 0) {
+				// Find first overlap to a read in this contig
+				for (uint32_t j = 0; j < src->length && j < 50; j++) {
+					ma_hit_t *h = &src->buffer[j];
+					if (h->del) continue;
+
+					uint32_t tn = Get_tn(*h);
+					if (already_written[tn]) {  // Check if target is in backbone
+						// Found overlap to backbone read - use its position as reference
+						estimated_start = Get_ts(*h);
+						estimated_end = Get_te(*h);
+						break;
+					}
+				}
+			}
+		}
+
+		// Add this read to the mapping vector
+		utg_read_mapping_t entry;
+		entry.read_id = rId;
+		entry.contig_id = uId;
+		entry.start_pos = estimated_start;
+		entry.end_pos = estimated_end;
+		entry.ori = 0;  // Forward strand for non-backbone
+		entry.coverage_class = 1;  // Mark as secondary/alternate
+		add_utg_read_mapping(read_mapping, &entry);
+
+		new_mappings++;
+	}
+
+	fprintf(stderr, "[M::%s] Augmented read mapping with %lu additional reads (total now: %lu)\n",
+			__func__, new_mappings, read_mapping->n);
+	free(already_written);
+}
+
+// ============================================================================
+// NEW: Read Lineage Tracking Functions
+// ============================================================================
+
+void init_read_lineage_v(read_lineage_v *x)
+{
+	x->n = 0;
+	x->m = 0;
+	x->a = NULL;
+}
+
+void destory_read_lineage_v(read_lineage_v *x)
+{
+	if (x->a) {
+		for (size_t i = 0; i < x->n; i++) {
+			if (x->a[i].contributor_ids) {
+				free(x->a[i].contributor_ids);
+			}
+		}
+		free(x->a);
+	}
+	x->n = 0;
+	x->m = 0;
+	x->a = NULL;
+}
+
+void add_read_lineage(read_lineage_v *x, read_lineage_t *entry)
+{
+	if (x->n == x->m) {
+		x->m = x->m == 0 ? 256 : x->m * 2;
+		x->a = (read_lineage_t *)realloc(x->a, x->m * sizeof(read_lineage_t));
+	}
+	// Copy entry and allocate contributor array
+	x->a[x->n].backbone_read_id = entry->backbone_read_id;
+	x->a[x->n].num_contributors = entry->num_contributors;
+	x->a[x->n].lineage_type = entry->lineage_type;
+
+	if (entry->num_contributors > 0 && entry->contributor_ids) {
+		x->a[x->n].contributor_ids = (uint32_t *)malloc(entry->num_contributors * sizeof(uint32_t));
+		memcpy(x->a[x->n].contributor_ids, entry->contributor_ids,
+		       entry->num_contributors * sizeof(uint32_t));
+	} else {
+		x->a[x->n].contributor_ids = NULL;
+	}
+	x->n++;
+}
+
+void write_read_lineage(const char *output_prefix, read_lineage_v *lineage)
+{
+	if (!output_prefix || !lineage || lineage->n == 0) return;
+
+	char *filename = (char*)malloc(strlen(output_prefix) + 50);
+	sprintf(filename, "%s.read_lineage.tsv", output_prefix);
+
+	FILE *fp = fopen(filename, "w");
+	if (!fp) {
+		fprintf(stderr, "[ERROR] Cannot open %s for writing\n", filename);
+		free(filename);
+		return;
+	}
+
+	// Write header
+	fprintf(fp, "backbone_read_id\tnum_contributors\tcontributor_ids\tlineage_type\n");
+
+	// Lineage type descriptions for reference:
+	// 0 = Direct Overlap: Normal overlapping reads in the same unitig/path
+	// 1 = Contained: Read completely contained within another read (redundant)
+	// 2 = Merged Bubble: Reads from alternative bubble paths (errors/variants)
+	// 3 = Rescue Path: Reads initially deleted but then rescued during assembly
+	const char *lineage_types[] = {
+		"direct",          // 0: Direct backbone read - strong signal
+		"contained_in",    // 1: Contained read - medium confidence
+		"merged_bubble",   // 2: Merged from bubble/alternative path - weak signal
+		"rescue_path"      // 3: Rescued from deleted state - low confidence
+	};
+
+	// Write lineage information for each backbone read
+	for (size_t i = 0; i < lineage->n; i++) {
+		fprintf(fp, "%u\t%u\t", lineage->a[i].backbone_read_id, lineage->a[i].num_contributors);
+
+		// Write contributor IDs as comma-separated list
+		if (lineage->a[i].num_contributors > 0 && lineage->a[i].contributor_ids) {
+			for (uint32_t j = 0; j < lineage->a[i].num_contributors; j++) {
+				if (j > 0) fprintf(fp, ",");
+				fprintf(fp, "%u", lineage->a[i].contributor_ids[j]);
+			}
+		}
+
+		fprintf(fp, "\t%u\n", lineage->a[i].lineage_type);
+	}
+
+	fclose(fp);
+	fprintf(stderr, "[M::%s] Written read lineage for %lu backbone reads to %s\n",
+			__func__, lineage->n, filename);
+	free(filename);
+}
+
+// ============================================================================
+// Build read lineage by analyzing overlaps from backbone reads
+// This traces each backbone read back to the reads it overlaps with
+// ============================================================================
+void build_read_lineage_from_overlaps(read_lineage_v *lineage, const utg_read_mapping_v *backbone_reads,
+                                       const void *sources_void, const void *RNF_void)
+{
+	if (!lineage || !backbone_reads || !sources_void || !RNF_void) return;
+
+	const ma_hit_t_alloc *sources = (const ma_hit_t_alloc *)sources_void;
+	const All_reads *RNF = (const All_reads *)RNF_void;
+
+	// For each backbone read, find its overlapping partners
+	uint32_t *contributors = (uint32_t *)malloc(10000 * sizeof(uint32_t));  // Temporary buffer
+	uint32_t max_contributors = 10000;
+
+	for (size_t i = 0; i < backbone_reads->n; i++) {
+		uint32_t read_id = backbone_reads->a[i].read_id;
+		uint32_t num_contributors = 0;
+
+		// Get overlaps for this read
+		if (read_id < RNF->total_reads && sources[read_id].buffer && sources[read_id].length > 0) {
+			// Collect all overlapping read IDs (non-deleted overlaps only)
+			for (uint32_t j = 0; j < sources[read_id].length; j++) {
+				ma_hit_t *h = &sources[read_id].buffer[j];
+				if (h->del) continue;  // Skip deleted overlaps
+
+				uint32_t overlap_partner = Get_tn(*h);
+
+				// Resize buffer if needed
+				if (num_contributors >= max_contributors) {
+					max_contributors *= 2;
+					contributors = (uint32_t *)realloc(contributors, max_contributors * sizeof(uint32_t));
+				}
+
+				// Add partner to contributors list
+				contributors[num_contributors++] = overlap_partner;
+			}
+		}
+
+		// Add the read itself as primary contributor
+		if (num_contributors >= max_contributors) {
+			max_contributors *= 2;
+			contributors = (uint32_t *)realloc(contributors, max_contributors * sizeof(uint32_t));
+		}
+		contributors[num_contributors++] = read_id;
+
+		// Create lineage entry
+		read_lineage_t entry;
+		entry.backbone_read_id = read_id;
+		entry.num_contributors = num_contributors;
+		entry.lineage_type = 0;  // Direct backbone read
+		entry.contributor_ids = NULL;
+
+		if (num_contributors > 0) {
+			entry.contributor_ids = (uint32_t *)malloc(num_contributors * sizeof(uint32_t));
+			memcpy(entry.contributor_ids, contributors, num_contributors * sizeof(uint32_t));
+		}
+
+		add_read_lineage(lineage, &entry);
+	}
+
+	free(contributors);
+
+	fprintf(stderr, "[M::%s] Built lineage for %lu backbone reads\n", __func__, lineage->n);
+}
+
+void write_read_coverage_and_overlaps(const char *output_prefix, const void *RNF_void,
+                                      const void *sources_void, const void *coverage_cut_void,
+                                      utg_read_mapping_v *assembled_reads)
+{
+	const All_reads *RNF = (const All_reads *)RNF_void;
+	const ma_hit_t_alloc *sources = (const ma_hit_t_alloc *)sources_void;
+	const ma_sub_t *coverage_cut = (const ma_sub_t *)coverage_cut_void;
+
+	if (!RNF || !sources || !coverage_cut || RNF->total_reads == 0) return;
+
+	// Build a set of assembled read IDs for quick lookup
+	uint8_t *is_assembled = (uint8_t *)calloc(RNF->total_reads, sizeof(uint8_t));
+	if (assembled_reads) {
+		for (size_t i = 0; i < assembled_reads->n; i++) {
+			is_assembled[assembled_reads->a[i].read_id] = 1;
+		}
+	}
+
+	char *filename = (char*)malloc(strlen(output_prefix) + 50);
+	sprintf(filename, "%s.read_coverage_info.tsv", output_prefix);
+
+	FILE *fp = fopen(filename, "w");
+	if (!fp) {
+		fprintf(stderr, "[ERROR] Cannot open %s for writing\n", filename);
+		free(filename);
+		free(is_assembled);
+		return;
+	}
+
+	// Write header
+	fprintf(fp, "read_id\tread_name\tread_length\tassembled\toverlap_count\t"
+		"high_cov_start\thigh_cov_end\tdeletion_status\n");
+
+	uint64_t unassembled_count = 0;
+
+	// Write info for each read
+	for (uint64_t i = 0; i < RNF->total_reads; i++) {
+		// Extract read name
+		uint64_t name_start = RNF->name_index[i];
+		uint64_t name_end = (i + 1 < RNF->total_reads) ? RNF->name_index[i + 1] : RNF->total_name_length;
+
+		char name_buffer[512];
+		uint64_t name_len = 0;
+
+		while (name_len < sizeof(name_buffer) - 1 &&
+		       name_start + name_len < name_end &&
+		       RNF->name[name_start + name_len] != ' ' &&
+		       RNF->name[name_start + name_len] != '\0') {
+			name_buffer[name_len] = RNF->name[name_start + name_len];
+			name_len++;
+		}
+		name_buffer[name_len] = '\0';
+
+		uint32_t overlap_count = sources[i].length;
+		uint32_t assembled_flag = is_assembled[i] ? 1 : 0;
+		if (!assembled_flag) unassembled_count++;
+
+		fprintf(fp, "%lu\t%s\t%lu\t%u\t%u\t%u\t%u\t%u\n",
+				i,
+				name_buffer,
+				RNF->read_length[i],
+				assembled_flag,
+				overlap_count,
+				coverage_cut[i].s,
+				coverage_cut[i].e,
+				coverage_cut[i].del);
+	}
+
+	fclose(fp);
+	fprintf(stderr, "[M::%s] Written coverage info for %lu reads (unassembled: %lu) to %s\n",
+			__func__, RNF->total_reads, unassembled_count, filename);
+
+	free(filename);
+	free(is_assembled);
+
+	// Now write detailed overlap information for unassembled reads
+	sprintf(filename, "%s.unassembled_read_overlaps.tsv", output_prefix);
+	fp = fopen(filename, "w");
+	if (!fp) {
+		fprintf(stderr, "[ERROR] Cannot open %s for writing\n", filename);
+		return;
+	}
+
+	fprintf(fp, "read_id\toverlap_partner_id\tquery_start\tquery_end\ttarget_start\ttarget_end\n");
+
+	uint64_t overlap_records = 0;
+	for (uint64_t i = 0; i < RNF->total_reads; i++) {
+		if (is_assembled[i]) continue;  // Skip assembled reads
+
+		ma_hit_t_alloc *src = (ma_hit_t_alloc *)&sources[i];
+		for (uint32_t j = 0; j < src->length; j++) {
+			ma_hit_t *h = &src->buffer[j];
+			if (h->del) continue;  // Skip deleted overlaps
+
+			uint32_t qn = Get_qn(*h);
+			uint32_t tn = Get_tn(*h);
+			uint32_t qs = Get_qs(*h);
+			uint32_t qe = Get_qe(*h);
+			uint32_t ts = Get_ts(*h);
+			uint32_t te = Get_te(*h);
+
+			fprintf(fp, "%lu\t%u\t%u\t%u\t%u\t%u\n",
+					i, tn, qs, qe, ts, te);
+			overlap_records++;
+		}
+	}
+
+	fclose(fp);
+	fprintf(stderr, "[M::%s] Written %lu overlap records for unassembled reads to %s\n",
+			__func__, overlap_records, filename);
+
+	filename = (char*)realloc(filename, strlen(output_prefix) + 50);
+	sprintf(filename, "%s.read_statistics.txt", output_prefix);
+	fp = fopen(filename, "w");
+	if (fp) {
+		fprintf(fp, "Read Assembly Statistics\n");
+		fprintf(fp, "========================\n");
+		fprintf(fp, "Total reads: %lu\n", RNF->total_reads);
+		fprintf(fp, "Assembled reads: %lu\n", RNF->total_reads - unassembled_count);
+		fprintf(fp, "Unassembled reads: %lu\n", unassembled_count);
+		fprintf(fp, "Unassembled percentage: %.2f%%\n",
+			(unassembled_count * 100.0) / RNF->total_reads);
+		fprintf(fp, "Total overlaps recorded: %lu\n", overlap_records);
+		fclose(fp);
+		fprintf(stderr, "[M::%s] Written statistics to %s\n", __func__, filename);
+	}
+
+	free(filename);
+}
+
 void prt_scaf_stats(sec_t *scp, ma_ug_t *ctg, const char* prefix, uint64_t id)
 {
     uint64_t k, tl0, tl1; ma_utg_t *z = NULL; char name[32];
@@ -14310,7 +14689,7 @@ void destory_hc_links(hc_links* link)
     kv_destroy(link->enzymes);
 }
 
-void print_utg(ma_ug_t **ug, asg_t *sg, ma_sub_t* coverage_cut, char* output_file_name, 
+void print_utg(ma_ug_t **ug, asg_t *sg, ma_sub_t* coverage_cut, char* output_file_name,
 ma_hit_t_alloc* sources, R_to_U* ruIndex, int max_hang, int min_ovlp, kvec_asg_arc_t_warp* new_rtg_edges)
 {
     if(asm_opt.b_low_cov > 0)
@@ -14350,7 +14729,19 @@ ma_hit_t_alloc* sources, R_to_U* ruIndex, int max_hang, int min_ovlp, kvec_asg_a
 
     // NEW: Export read-to-contig mapping if requested
     if (asm_opt.write_read_mapping && asm_opt.read_mapping_ptr) {
+        // Augment the backbone read mapping with all reads assigned to contigs
+        augment_read_mapping_with_complete_reads((utg_read_mapping_v*)asm_opt.read_mapping_ptr,
+                                                 *ug, &R_INF, sources, coverage_cut, ruIndex);
+        // Write complete read mappings to TSV
         write_utg_read_mapping(output_file_name, *ug, NULL, "ptg", (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
+
+        // NEW: Build and export read lineage for traceability
+        // This shows which original reads contributed to each backbone read through overlaps
+        read_lineage_v lineage;
+        init_read_lineage_v(&lineage);
+        build_read_lineage_from_overlaps(&lineage, (utg_read_mapping_v*)asm_opt.read_mapping_ptr, sources, &R_INF);
+        write_read_lineage(output_file_name, &lineage);
+        destory_read_lineage_v(&lineage);
     }
 
     free(gfa_name);
@@ -16375,12 +16766,12 @@ void refine_hic_trans_mmhap(ug_opt_t *opt, kv_u_trans_t *ta, asg_t *sg, ma_ug_t 
 
 void output_contig_graph_alternative(asg_t *sg, ma_sub_t* coverage_cut, char* output_file_name,
 ma_hit_t_alloc* sources, R_to_U* ruIndex, int max_hang, int min_ovlp);
-void output_hic_graph(asg_t *sg, ma_sub_t* coverage_cut, char* output_file_name, 
-ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources, 
-long long tipsLen, float tip_drop_ratio, long long stops_threshold, 
-R_to_U* ruIndex, float chimeric_rate, float drop_ratio, int max_hang, int min_ovlp, 
+void output_hic_graph(asg_t *sg, ma_sub_t* coverage_cut, char* output_file_name,
+ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources,
+long long tipsLen, float tip_drop_ratio, long long stops_threshold,
+R_to_U* ruIndex, float chimeric_rate, float drop_ratio, int max_hang, int min_ovlp,
 long long gap_fuzz, bub_label_t* b_mask_t, ug_opt_t *opt)
-{ 
+{
     hic_clean(sg);
     kvec_pe_hit *rhits = NULL;
     ma_ug_t *ug_fa = NULL, *ug_mo = NULL;
@@ -16407,14 +16798,22 @@ long long gap_fuzz, bub_label_t* b_mask_t, ug_opt_t *opt)
         adjust_utg_by_primary(&copy_ug, copy_sg, TRIO_THRES, sources, reverse_sources, coverage_cut, 
         tipsLen, tip_drop_ratio, stops_threshold, ruIndex, chimeric_rate, drop_ratio, 
         max_hang, min_ovlp, &new_rtg_edges, &cov, b_mask_t, 1, 0);
-        print_utg(&copy_ug, copy_sg, coverage_cut, output_file_name, sources, ruIndex, max_hang, 
+        print_utg(&copy_ug, copy_sg, coverage_cut, output_file_name, sources, ruIndex, max_hang,
         min_ovlp, &new_rtg_edges);
 
         if(asm_opt.is_alt)
         {
-            output_contig_graph_alternative(copy_sg, coverage_cut, output_file_name, sources, ruIndex, max_hang, 
+            output_contig_graph_alternative(copy_sg, coverage_cut, output_file_name, sources, ruIndex, max_hang,
             min_ovlp);
         }
+
+        // Export comprehensive coverage info and all read overlaps (including unassembled reads)
+        // This works in trio mode after print_utg populates the read_mapping vector
+        if (asm_opt.write_read_mapping && asm_opt.read_mapping_ptr) {
+            write_read_coverage_and_overlaps(output_file_name, &R_INF, sources, coverage_cut,
+                                             (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
+        }
+
         ma_ug_destroy(copy_ug);
         asg_destroy(copy_sg);
         // clean_u_trans_t_idx(&(cov->t_ch->k_trans), ug, sg);
@@ -17694,12 +18093,20 @@ int gap_fuzz, bub_label_t* b_mask_t, ug_opt_t *opt)
     tipsLen, tip_drop_ratio, stops_threshold, ruIndex, chimeric_rate, drop_ratio, 
     max_hang, min_ovlp, &new_rtg_edges, &cov, b_mask_t, 1, 0/**1**/);
     // adjust_utg_advance(copy_sg, copy_ug, reverse_sources, ruIndex, b_mask_t);
-    // get_utg_ovlp(&copy_ug, copy_sg, sources, reverse_sources, coverage_cut, 
+    // get_utg_ovlp(&copy_ug, copy_sg, sources, reverse_sources, coverage_cut,
     // ruIndex, max_hang, min_ovlp, &new_rtg_edges, b_mask_t, NULL);
     // exit(1);
     /*******************************for debug************************************/
-    print_utg(&copy_ug, copy_sg, coverage_cut, output_file_name, sources, ruIndex, max_hang, 
+    print_utg(&copy_ug, copy_sg, coverage_cut, output_file_name, sources, ruIndex, max_hang,
     min_ovlp, &new_rtg_edges);
+
+    // Export comprehensive coverage info and all read overlaps (including unassembled reads)
+    // This works after print_utg populates the read_mapping vector with PTG data
+    if (asm_opt.write_read_mapping && asm_opt.read_mapping_ptr) {
+        write_read_coverage_and_overlaps(output_file_name, &R_INF, sources, coverage_cut,
+                                         (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
+    }
+
     ma_ug_destroy(copy_ug);
     asg_destroy(copy_sg);
 
@@ -23451,6 +23858,13 @@ int min_ovlp, long long gap_fuzz, bub_label_t* b_mask_t, ma_ug_t **rhu0, ma_ug_t
             (*rhu1) = hu1; // ma_ug_destroy(hu1); 
         }
         kv_destroy(arcs1.a);
+    }
+
+    // Export comprehensive coverage info and all read overlaps for trio mode
+    // This is called AFTER all haplotype outputs, using accumulated read_mapping data
+    if (asm_opt.write_read_mapping && asm_opt.read_mapping_ptr) {
+        write_read_coverage_and_overlaps(output_file_name, &R_INF, sources, coverage_cut,
+                                         (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     }
 }
 
@@ -32838,7 +33252,14 @@ R_to_U* ruIndex, float chimeric_rate, float drop_ratio, int max_hang, int min_ov
 
     // NEW: Export read-to-contig mapping if requested
     if (asm_opt.write_read_mapping && asm_opt.read_mapping_ptr) {
+        // Augment the backbone read mapping with all reads assigned to contigs
+        augment_read_mapping_with_complete_reads((utg_read_mapping_v*)asm_opt.read_mapping_ptr,
+                                                 ug, &R_INF, sources, coverage_cut, ruIndex);
+        // Write complete read mappings to TSV
         write_utg_read_mapping(output_file_name, ug, NULL, "ptg", (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
+        // Export coverage info and all read overlaps (including unassembled reads)
+        write_read_coverage_and_overlaps(output_file_name, &R_INF, sources, coverage_cut,
+                                         (utg_read_mapping_v*)asm_opt.read_mapping_ptr);
     }
 
     free(gfa_name);
